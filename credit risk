@@ -1,0 +1,191 @@
+
+needed <- c("tidyverse","broom","rsample","pROC")
+to_install <- setdiff(needed, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+
+library(tidyverse)
+library(broom)
+library(rsample)
+library(pROC)
+
+# Load data
+df <- read.csv("credit.csv", stringsAsFactors = FALSE)
+
+# Make target readable (1 = default, 2 = non-default)
+df <- df %>%
+  mutate(
+    default = factor(default, levels = c(1,2), labels = c("default","non_default")),
+    across(where(is.character), ~trimws(.x))
+  )
+
+
+# Histogram 
+ggplot(df, aes(x = age)) +
+  geom_histogram(aes(y = ..density..), bins = 30, color = "white") +
+  geom_density(linewidth = 1) +
+  labs(title = "Age Distribution (Histogram + Density)", x = "Age", y = "Density")
+
+Q-Q plot 
+qqnorm(df$age); qqline(df$age, col = 2, lwd = 2)
+
+#Shapiro–Wilk normality test
+shapiro.test(df$age)
+
+#Quick summary stats
+df %>% summarise(n = n(), mean = mean(age), sd = sd(age), min = min(age), q25 = quantile(age,.25),
+                 median = median(age), q75 = quantile(age,.75), max = max(age))
+
+
+# Boxplot of amount by purpose
+ggplot(df, aes(x = purpose, y = amount)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  coord_flip() +
+  labs(title = "Loan Amount by Purpose", x = "Purpose", y = "Amount")
+
+# One-way ANOVA
+fit_aov <- aov(amount ~ purpose, data = df)
+summary(fit_aov)
+
+# Post-hoc pairwise comparisons (Tukey)
+TukeyHSD(fit_aov)
+
+
+# Stacked proportion bar 
+ggplot(df, aes(x = employment_length, fill = default)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(title = "Default Proportion by Employment Length", x = "Employment Length", y = "Proportion")
+
+# Table of default rates per category
+df %>%
+  count(employment_length, default) %>%
+  group_by(employment_length) %>%
+  mutate(rate = n/sum(n)) %>%
+  filter(default == "default") %>%
+  arrange(desc(rate))
+
+
+# Chi-square test: savings_balance vs default
+tab_sav <- table(df$savings_balance, df$default)
+tab_sav
+chisq.test(tab_sav)  # Check expected counts; if small, consider Fisher's exact
+
+# Visual: default proportion by savings_balance
+ggplot(df, aes(x = savings_balance, fill = default)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(title = "Default Proportion by Savings Balance", x = "Savings Balance", y = "Proportion")
+
+
+# Welch t-test 
+t.test(amount ~ default, data = df)
+
+# Boxplot by default group
+ggplot(df, aes(x = default, y = amount, fill = default)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.6) +
+  labs(title = "Loan Amount by Default Status", x = "", y = "Amount")
+
+
+
+# Chi-square test: checking_balance vs default
+tab_chk <- table(df$checking_balance, df$default)
+tab_chk
+chisq.test(tab_chk)  # If warnings about expected counts, consider combining rare levels or Fisher's exact
+
+# Visual: default proportion by checking_balance
+ggplot(df, aes(x = checking_balance, fill = default)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(title = "Default Proportion by Checking Balance", x = "Checking Balance", y = "Proportion")
+
+
+# Select numeric variables 
+num_vars <- c("months_loan_duration","amount","installment_rate",
+              "residence_history","age","existing_credits","dependents")
+
+# Correlation matrix 
+corr_mat <- df %>%
+  select(any_of(num_vars)) %>%
+  cor(use = "pairwise.complete.obs")
+round(corr_mat, 3)
+
+# Formal tests for selected pairs
+cor.test(df$months_loan_duration, df$amount, use = "pairwise.complete.obs", method = "pearson")
+cor.test(df$age, df$amount, use = "pairwise.complete.obs", method = "pearson")
+
+
+# Ensure response factor levels ("default" is modeled as the event)
+levels(df$default)  # should be: "default", "non_default"
+
+# Univariate logistic regression
+fit_uni <- glm(default ~ months_loan_duration, data = df, family = binomial)
+summary(fit_uni)
+
+# Odds ratio (per 1 month increase) with 95% CI
+uni_or <- broom::tidy(fit_uni, exponentiate = TRUE, conf.int = TRUE)
+uni_or
+
+
+#q9
+# Choose a compact, interpretable model 
+form <- default ~ checking_balance + savings_balance + employment_length +
+  months_loan_duration + amount + age
+
+fit_multi <- glm(form, data = df, family = binomial)
+summary(fit_multi)
+
+# Odds ratios + 95% CI, sorted by effect size
+or_tbl <- broom::tidy(fit_multi, exponentiate = TRUE, conf.int = TRUE) %>%
+  arrange(desc(abs(log(estimate))))
+or_tbl
+
+# Optional: partial effects plot for a numeric predictor
+# (simple visualization of relationship; not partial dependence)
+ggplot(df, aes(x = months_loan_duration, y = as.numeric(default) - 1)) +
+  geom_jitter(height = 0.05, alpha = 0.2) +
+  stat_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(title = "Default vs Loan Duration (logit fit)", x = "Months Loan Duration", y = "Default (1=yes)")
+
+
+set.seed(7205)
+
+# Stratified split by outcome
+split <- initial_split(df, prop = 0.7, strata = default)
+train <- training(split)
+test  <- testing(split)
+
+# Refit on train
+fit_tr <- glm(default ~ checking_balance + savings_balance + employment_length +
+                months_loan_duration + amount + age,
+              data = train, family = binomial)
+
+# Predict on test
+test$prob_default <- predict(fit_tr, newdata = test, type = "response")
+test$pred_class <- factor(ifelse(test$prob_default >= 0.5, "default", "non_default"),
+                          levels = c("default","non_default"))
+
+# Confusion matrix + basic metrics
+cm <- table(Observed = test$default, Predicted = test$pred_class)
+cm
+
+accuracy <- sum(diag(cm))/sum(cm)
+sensitivity <- cm["default","default"] / sum(cm["default", ])
+specificity <- cm["non_default","non_default"] / sum(cm["non_default", ])
+c(accuracy = accuracy, sensitivity = sensitivity, specificity = specificity)
+
+# ROC / AUC (ensure "non_default" is the negative class)
+roc_obj <- roc(response = test$default,
+               predictor = test$prob_default,
+               levels = c("non_default","default"), direction = "<")
+auc_val <- auc(roc_obj); auc_val
+
+# Plot ROC
+plot(roc_obj, main = paste0("ROC Curve (AUC = ", round(auc_val, 3), ")"))
+
+# Example: correlation between loan amount and duration
+cor.test(df$amount, df$months_loan_duration, method = "pearson")
+cor.test(df$amount, df$months_loan_duration, method = "spearman")
+
